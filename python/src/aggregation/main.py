@@ -23,11 +23,13 @@ class AggregationFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
-        # Por cliente: cantidad acumulada por fruta y cuantas instancias de
-        # Sum ya mandaron su parcial para ese cliente (cada una de las
-        # SUM_AMOUNT instancias manda exactamente un mensaje por cliente,
-        # aunque le hayan tocado cero frutas de las que este Aggregation
-        # atiende).
+        """
+        By client: accumulated quantity per fruit and how many instances of
+        Sum have already sent their partial for that client (each of the
+        SUM_AMOUNT instances sends exactly one message per client,
+        even if they got zero fruits from those this Aggregation
+        handles).
+        """
         self.pending = {}
 
     def _process_message(self, client_id, sum_id, items):
