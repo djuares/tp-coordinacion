@@ -91,9 +91,11 @@ class SumFilter:
         if fields["type"] == "data":
             self._process_data(fields["client_id"], fields["fruit"], fields["amount"])
         else:
-            # Avisamos a TODAS las instancias de Sum (incluida esta misma)
-            # que el cliente termino, para que cada una vuelque lo que
-            # haya acumulado localmente para ese cliente.
+            """
+            We notify ALL instances of Sum (including this one)
+            that the client has finished, so that each one can dump what
+            they have accumulated locally for that client.
+            """
             self.control_out.send(
                 message_protocol.internal.serialize(
                     {"client_id": fields["client_id"]}
