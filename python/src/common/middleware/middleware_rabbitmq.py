@@ -1,3 +1,6 @@
+import logging
+import time
+
 import pika
 
 from .middleware import (
@@ -8,23 +11,40 @@ from .middleware import (
     MessageMiddlewareCloseError,
 )
 
+CONNECTION_RETRIES = 10
+CONNECTION_RETRY_DELAY = 3
+
 
 class _MessageMiddlewareRabbitMQ:
     """Common RabbitMQ functionality for the queue and exchange middleware."""
 
-    def _connect(self, host):
+    def _connect(self, host, retries=CONNECTION_RETRIES, delay=CONNECTION_RETRY_DELAY):
+        """Connect to RabbitMQ, retrying while the broker is not ready yet.
+
+        Controls may start before RabbitMQ accepts connections, so a failed
+        connection attempt is retried up to `retries` times, waiting `delay`
+        seconds between attempts. Any other error fails immediately.
+        """
         self._connection = None
-        try:
-            self._connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=host)
-            )
-            self._channel = self._connection.channel()
-        except pika.exceptions.AMQPConnectionError as exc:
-            self._close_quietly()
-            raise MessageMiddlewareDisconnectedError() from exc
-        except Exception as exc:
-            self._close_quietly()
-            raise MessageMiddlewareMessageError() from exc
+        for attempt in range(1, retries + 1):
+            try:
+                self._connection = pika.BlockingConnection(
+                    pika.ConnectionParameters(host=host)
+                )
+                self._channel = self._connection.channel()
+                return
+            except pika.exceptions.AMQPConnectionError as exc:
+                self._close_quietly()
+                if attempt == retries:
+                    raise MessageMiddlewareDisconnectedError() from exc
+                logging.warning(
+                    f"RabbitMQ not ready (attempt {attempt}/{retries}), "
+                    f"retrying in {delay}s"
+                )
+                time.sleep(delay)
+            except Exception as exc:
+                self._close_quietly()
+                raise MessageMiddlewareMessageError() from exc
 
     def _close_quietly(self):
         """Close the connection if it is still open, without raising."""
@@ -53,6 +73,11 @@ class _MessageMiddlewareRabbitMQ:
     def _consume(self, on_message_callback):
         try:
             self._consuming = True
+            # Deliver one message at a time: the next one is not sent until the
+            # current one is acked. This spreads the work evenly between
+            # replicas sharing a queue and keeps the "FIFO + already processed"
+            # assumption used to coordinate the EOF between Sum instances.
+            self._channel.basic_qos(prefetch_count=1)
             self._channel.basic_consume(
                 queue=self._queue_name,
                 on_message_callback=self._build_callback(on_message_callback),
