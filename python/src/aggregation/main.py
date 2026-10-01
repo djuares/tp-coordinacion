@@ -1,6 +1,7 @@
 import os
 import signal
 import logging
+import threading
 
 from common import middleware, message_protocol, fruit_item
 
@@ -13,9 +14,7 @@ AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 TOP_SIZE = int(os.environ["TOP_SIZE"])
 
-
 class AggregationFilter:
-
     def __init__(self):
         self.input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{ID}"]
@@ -23,30 +22,34 @@ class AggregationFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
-        """
-        By client: accumulated quantity per fruit and how many instances of
-        Sum have already sent their partial for that client (each of the
-        SUM_AMOUNT instances sends exactly one message per client,
-        even if they got zero fruits from those this Aggregation
-        handles).
-        """
         self.pending = {}
+        self.lock = threading.Lock()
 
-    def _process_message(self, client_id, sum_id, items):
-        state = self.pending.setdefault(client_id, {"amounts": {}, "count": 0})
-        for fruit, amount in items:
-            state["amounts"][fruit] = state["amounts"].get(fruit, 0) + amount
-        state["count"] += 1
+    def _process_message(self, client_id, sum_id, message_type, items):
+        should_flush = False
+        with self.lock:
+            state = self.pending.setdefault(
+                client_id, {"amounts": {}, "done_sums": set()}
+            )
+            if message_type == "data":
+                for fruit, amount in items:
+                    state["amounts"][fruit] = state["amounts"].get(fruit, 0) + amount
+            elif message_type == "sum_done":
+                state["done_sums"].add(sum_id)
+                should_flush = len(state["done_sums"]) == SUM_AMOUNT
 
-        if state["count"] == SUM_AMOUNT:
+        if should_flush:
             self._flush_client(client_id)
 
     def _flush_client(self, client_id):
         logging.info(f"Aggregation {ID}: flushing client {client_id}")
-        state = self.pending.pop(client_id)
+        with self.lock:
+            state = self.pending.pop(client_id, {"amounts": {}})
+            amounts = state["amounts"]
+
         top_items = [
             fruit_item.FruitItem(fruit, amount)
-            for fruit, amount in state["amounts"].items()
+            for fruit, amount in amounts.items()
         ]
         top_items.sort()
         top_items.reverse()
@@ -56,14 +59,20 @@ class AggregationFilter:
             message_protocol.internal.serialize(
                 {
                     "client_id": client_id,
+                    "aggregation_id": ID,
                     "items": [[fi.fruit, fi.amount] for fi in top_items],
                 }
             )
         )
 
-    def process_messsage(self, message, ack, nack):
+    def process_message(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
-        self._process_message(fields["client_id"], fields["sum_id"], fields["items"])
+        self._process_message(
+            fields["client_id"],
+            fields["sum_id"],
+            fields["type"],
+            fields.get("items", []),
+        )
         ack()
 
     def stop(self):
@@ -74,7 +83,7 @@ class AggregationFilter:
         self.output_queue.close()
 
     def start(self):
-        self.input_exchange.start_consuming(self.process_messsage)
+        self.input_exchange.start_consuming(self.process_message)
 
 
 def main():

@@ -15,7 +15,6 @@ TOP_SIZE = int(os.environ["TOP_SIZE"])
 
 
 class JoinFilter:
-
     def __init__(self):
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
@@ -23,26 +22,28 @@ class JoinFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
-        """
-        By client: partial tops received and how many instances of
-        Aggregation have already sent theirs. Since each fruit belongs to a
-        single Aggregation (partitioned by hash in Sum), there is no
-        overlap of fruits between the different partial tops.
-        """
+        # By client: partial tops received from Aggregation replicas.
         self.pending = {}
 
-    def _process_message(self, client_id, items):
-        state = self.pending.setdefault(client_id, {"items": [], "count": 0})
+    def _process_aggregation_result(self, client_id, aggregation_id, items):
+        state = self.pending.setdefault(
+            client_id, {"items": [], "aggregation_ids": set()}
+        )
+        if aggregation_id in state["aggregation_ids"]:
+            return
         state["items"].extend(items)
-        state["count"] += 1
+        state["aggregation_ids"].add(aggregation_id)
 
-        if state["count"] == AGGREGATION_AMOUNT:
+        if len(state["aggregation_ids"]) == AGGREGATION_AMOUNT:
             self._flush_client(client_id)
 
     def _flush_client(self, client_id):
         logging.info(f"Join: flushing client {client_id}")
         state = self.pending.pop(client_id)
-        top_items = [fruit_item.FruitItem(fruit, amount) for fruit, amount in state["items"]]
+        top_items = [
+            fruit_item.FruitItem(fruit, amount)
+            for fruit, amount in state["items"]
+        ]
         top_items.sort()
         top_items.reverse()
         top_items = top_items[:TOP_SIZE]
@@ -56,9 +57,11 @@ class JoinFilter:
             )
         )
 
-    def process_messsage(self, message, ack, nack):
+    def process_message(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
-        self._process_message(fields["client_id"], fields["items"])
+        self._process_aggregation_result(
+            fields["client_id"], fields["aggregation_id"], fields["items"]
+        )
         ack()
 
     def stop(self):
@@ -69,7 +72,7 @@ class JoinFilter:
         self.output_queue.close()
 
     def start(self):
-        self.input_queue.start_consuming(self.process_messsage)
+        self.input_queue.start_consuming(self.process_message)
 
 
 def main():

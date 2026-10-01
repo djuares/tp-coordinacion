@@ -222,11 +222,18 @@ class MessageMiddlewareExchangeRabbitMQ(_MessageMiddlewareRabbitMQ, MessageMiddl
         self._stop()
 
     def send(self, message):
-        # A single middleware instance may be initialized with several routing
-        # keys. A message is sent using each key, so it reaches every queue
-        # bound to that key.
+        # Preserve the original middleware contract: send to every configured
+        # routing key.
         for routing_key in self._routing_keys:
             self._send(self._exchange_name, routing_key, message)
+
+    def send_to(self, routing_key, message):
+        # Producer-side routing without creating one middleware connection per
+        # destination. The routing key must be one of those configured when
+        # the exchange middleware was created.
+        if routing_key not in self._routing_keys:
+            raise MessageMiddlewareMessageError()
+        self._send(self._exchange_name, routing_key, message)
 
     def close(self):
         self._close()
