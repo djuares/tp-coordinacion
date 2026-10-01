@@ -13,15 +13,26 @@ class _MessageMiddlewareRabbitMQ:
     """Common RabbitMQ functionality for the queue and exchange middleware."""
 
     def _connect(self, host):
+        self._connection = None
         try:
             self._connection = pika.BlockingConnection(
                 pika.ConnectionParameters(host=host)
             )
             self._channel = self._connection.channel()
         except pika.exceptions.AMQPConnectionError as exc:
+            self._close_quietly()
             raise MessageMiddlewareDisconnectedError() from exc
         except Exception as exc:
+            self._close_quietly()
             raise MessageMiddlewareMessageError() from exc
+
+    def _close_quietly(self):
+        """Close the connection if it is still open, without raising."""
+        try:
+            if self._connection is not None and self._connection.is_open:
+                self._connection.close()
+        except Exception:
+            pass
 
     def _ack(self, delivery_tag):
         try:
@@ -48,10 +59,8 @@ class _MessageMiddlewareRabbitMQ:
             )
             self._channel.start_consuming()
         except pika.exceptions.AMQPConnectionError as exc:
-            self._consuming = False
             raise MessageMiddlewareDisconnectedError() from exc
         except Exception as exc:
-            self._consuming = False
             raise MessageMiddlewareMessageError() from exc
         finally:
             self._consuming = False
@@ -109,10 +118,10 @@ class MessageMiddlewareQueueRabbitMQ(_MessageMiddlewareRabbitMQ, MessageMiddlewa
             self._queue_name = queue_name
             self._channel.queue_declare(queue=queue_name)
         except pika.exceptions.AMQPConnectionError as exc:
-            self._connection.close()
+            self._close_quietly()
             raise MessageMiddlewareDisconnectedError() from exc
         except Exception as exc:
-            self._connection.close()
+            self._close_quietly()
             raise MessageMiddlewareMessageError() from exc
 
     def start_consuming(self, on_message_callback):
@@ -132,6 +141,7 @@ class MessageMiddlewareExchangeRabbitMQ(_MessageMiddlewareRabbitMQ, MessageMiddl
 
     def __init__(self, host, exchange_name, routing_keys):
         self._consuming = False
+        self._queue_name = None
         self._connect(host)
 
         try:
@@ -141,31 +151,46 @@ class MessageMiddlewareExchangeRabbitMQ(_MessageMiddlewareRabbitMQ, MessageMiddl
                 exchange=exchange_name,
                 exchange_type="direct",
             )
+        except pika.exceptions.AMQPConnectionError as exc:
+            self._close_quietly()
+            raise MessageMiddlewareDisconnectedError() from exc
+        except Exception as exc:
+            self._close_quietly()
+            raise MessageMiddlewareMessageError() from exc
 
-            # Each middleware instance gets its own exclusive queue. This is
-            # what makes an exchange broadcast a message to every consumer
-            # instead of load-balancing messages between consumers.
+    def _ensure_queue(self):
+        """Create the exclusive queue and its bindings the first time it is needed.
+
+        Each middleware instance that consumes gets its own exclusive queue.
+        This is what makes an exchange broadcast a message to every consumer
+        instead of load-balancing messages between consumers. Pure producers
+        never create it, so no unconsumed copies pile up for them.
+        """
+        if self._queue_name is not None:
+            return
+
+        try:
             declared_queue = self._channel.queue_declare(
                 queue="",
                 exclusive=True,
                 auto_delete=True,
             )
-            self._queue_name = declared_queue.method.queue
+            queue_name = declared_queue.method.queue
 
-            for routing_key in routing_keys:
+            for routing_key in self._routing_keys:
                 self._channel.queue_bind(
-                    exchange=exchange_name,
-                    queue=self._queue_name,
+                    exchange=self._exchange_name,
+                    queue=queue_name,
                     routing_key=routing_key,
                 )
+            self._queue_name = queue_name
         except pika.exceptions.AMQPConnectionError as exc:
-            self._connection.close()
             raise MessageMiddlewareDisconnectedError() from exc
         except Exception as exc:
-            self._connection.close()
             raise MessageMiddlewareMessageError() from exc
 
     def start_consuming(self, on_message_callback):
+        self._ensure_queue()
         self._consume(on_message_callback)
 
     def stop_consuming(self):
